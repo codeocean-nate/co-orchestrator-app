@@ -1,0 +1,4 @@
+streamlit>=1.50
+codeocean>=0.16
+pandas>=2.0
+requests>=2.31

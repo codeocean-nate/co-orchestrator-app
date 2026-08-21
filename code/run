@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# This capsule hosts a Streamlit app. It is NOT served by a Reproducible Run:
+# Code Ocean's Streamlit Cloud Workstation automatically serves
+# /code/streamlit_app.py when launched from the Reproducibility Panel
+# (and via "Open No-Code App" if the capsule is released as a No-Code App).
+#
+# This run script exists because a capsule release requires at least one
+# completed Reproducible Run — so it just sanity-checks the environment,
+# leaves a note in /results, and exits.
+#
+cd "$(dirname "$0")"
+RESULTS_DIR="${RESULTS_DIR:-/results}"
+
+echo "Verifying the orchestrator app's environment..."
+python3 - <<'PY'
+import importlib
+from importlib.metadata import version
+
+for pkg in ("streamlit", "codeocean", "pandas", "requests"):
+    importlib.import_module(pkg)
+    print("  %-10s %s" % (pkg, version(pkg)))
+print("Environment OK — all app dependencies import cleanly.")
+PY
+
+python3 -m py_compile streamlit_app.py co_api.py
+echo "App code compiles."
+
+cat > "$RESULTS_DIR/README.txt" <<'TXT'
+This capsule hosts the Code Ocean Orchestrator, a Streamlit app.
+
+To use it, launch the Streamlit Cloud Workstation from this capsule's
+Reproducibility Panel (or open it as a No-Code App if released).
+A Reproducible Run of this capsule only verifies the environment.
+TXT
+echo "Done."
