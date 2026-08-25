@@ -31,7 +31,12 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from co_api import Orchestrator, computation_succeeded
+from co_api import (
+    Orchestrator,
+    computation_succeeded,
+    detect_domain_from_git,
+    normalize_domain,
+)
 
 # ---------------------------------------------------------------------------
 # Page setup + session state
@@ -94,7 +99,16 @@ def set_snippet(title, code):
 # Configuration (priority: env var -> sidebar input; persisted in session state)
 # ---------------------------------------------------------------------------
 
-def _sidebar_text(label, state_key, default="", secret=False, help_text=None):
+DOMAIN_LABEL = "Code Ocean domain"
+DOMAIN_PLACEHOLDER = "https://your-deployment.codeocean.com"
+DOMAIN_HELP = (
+    "Base URL of your Code Ocean deployment (the host you sign in to), e.g. "
+    "https://your-deployment.codeocean.com. Set $CODEOCEAN_DOMAIN to skip this."
+)
+
+
+def _sidebar_text(label, state_key, default="", secret=False, help_text=None,
+                  placeholder=None):
     if state_key not in st.session_state:
         st.session_state[state_key] = default
     return st.sidebar.text_input(
@@ -102,10 +116,12 @@ def _sidebar_text(label, state_key, default="", secret=False, help_text=None):
         key=state_key,
         type="password" if secret else "default",
         help=help_text,
+        placeholder=placeholder,
     ).strip()
 
 
-def resolve_config(label, env_vars, state_key, default="", secret=False, help_text=None):
+def resolve_config(label, env_vars, state_key, default="", secret=False, help_text=None,
+                   placeholder=None):
     """Env var wins; otherwise fall back to a sidebar input kept in session state."""
     for env_var in env_vars:
         value = os.environ.get(env_var, "").strip()
@@ -116,7 +132,41 @@ def resolve_config(label, env_vars, state_key, default="", secret=False, help_te
                 st.sidebar.text_input(label, value=value, disabled=True,
                                       help="Set from $%s" % env_var, key="env_" + state_key)
             return value
-    return _sidebar_text(label, state_key, default=default, secret=secret, help_text=help_text)
+    return _sidebar_text(label, state_key, default=default, secret=secret,
+                         help_text=help_text, placeholder=placeholder)
+
+
+@st.cache_data(show_spinner=False)
+def autodetected_domain():
+    """Probe the capsule's git remote once per session (cached; never raises)."""
+    return detect_domain_from_git()
+
+
+def resolve_domain():
+    """Deployment-agnostic domain resolution, in priority order:
+
+    1. ``$CODEOCEAN_DOMAIN`` — explicit, always wins.
+    2. Auto-detection from the capsule's git remote (works out of the box
+       inside any Code Ocean cloud workstation, on any deployment).
+    3. A sidebar text input, empty by default — no customer-specific value is
+       ever pre-filled.
+    """
+    env_value = normalize_domain(os.environ.get("CODEOCEAN_DOMAIN", ""))
+    if env_value:
+        st.sidebar.text_input(DOMAIN_LABEL, value=env_value, disabled=True,
+                              help="Set from $CODEOCEAN_DOMAIN", key="env_cfg_domain")
+        return env_value
+
+    detected = normalize_domain(autodetected_domain())
+    value = normalize_domain(_sidebar_text(
+        DOMAIN_LABEL, "cfg_domain",
+        default=detected,
+        help_text=DOMAIN_HELP,
+        placeholder=DOMAIN_PLACEHOLDER,
+    ))
+    if detected and value == detected:
+        st.sidebar.caption("🔎 Domain auto-detected from this capsule")
+    return value
 
 
 st.sidebar.markdown("## 🌊 Configuration")
@@ -125,10 +175,7 @@ st.sidebar.caption(
     "here and persists for this browser session."
 )
 
-domain = resolve_config(
-    "Code Ocean domain", ["CODEOCEAN_DOMAIN"], "cfg_domain",
-    default="https://acmecorp-demo.codeocean.com",
-)
+domain = resolve_domain()
 token = resolve_config(
     "API token", ["CODEOCEAN_TOKEN", "API_SECRET", "CUSTOM_KEY"], "cfg_token",
     secret=True, help_text="Personal access token. Never displayed or logged.",

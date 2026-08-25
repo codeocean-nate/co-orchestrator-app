@@ -24,7 +24,14 @@ for pkg in ("streamlit", "codeocean", "pandas", "requests"):
 print("Environment OK — all app dependencies import cleanly.")
 PY
 
-python3 -m py_compile streamlit_app.py co_api.py
+# Compile to a scratch location: /code may be mounted read-only during a run,
+# and py_compile's default would try to write __pycache__ next to the sources.
+python3 - <<'PY'
+import py_compile, tempfile, os
+out = tempfile.mkdtemp()
+for name in ("streamlit_app.py", "co_api.py"):
+    py_compile.compile(name, cfile=os.path.join(out, name + "c"), doraise=True)
+PY
 echo "App code compiles."
 
 cat > "$RESULTS_DIR/README.txt" <<'TXT'
