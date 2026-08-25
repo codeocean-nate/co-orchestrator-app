@@ -1,8 +1,7 @@
 """Thin Code Ocean SDK wrapper used by the orchestrator demo.
 
-This module is deliberately Streamlit-free so the same orchestration logic
-drives both the Streamlit UI (streamlit_app.py) and the headless smoke test
-(scripts/smoke_test.py).
+This module is deliberately Streamlit-free, so the same orchestration logic can
+drive the Streamlit UI (streamlit_app.py) and any headless script or notebook.
 
 Code Ocean concepts, in one paragraph
 -------------------------------------
@@ -26,6 +25,8 @@ names below match that SDK exactly:
   (``.items`` of FolderItem with ``.name .path .type .size``)
 * ``client.computations.get_result_file_urls(id, path) -> FileURLs``
   (``.download_url`` is a presigned URL; fetch it with requests)
+* ``client.capsules.get_capsule_app_panel(id) -> AppPanel`` (404 = no panel;
+  any other failure raises AppPanelLookupError — see get_app_panel)
 """
 
 from __future__ import annotations
@@ -34,21 +35,27 @@ import os
 import re
 import subprocess
 import time
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
 
 import requests
 from urllib3.util import Retry
 
 from codeocean import CodeOcean
-from codeocean.capsule import Capsule, CapsuleSearchParams
-from codeocean.computation import Computation, RunParams, DataAssetsRunParam
+from codeocean.capsule import AppPanel, Capsule, CapsuleSearchParams
+from codeocean.computation import (
+    Computation,
+    DataAssetsRunParam,
+    NamedRunParam,
+    RunParams,
+)
 from codeocean.data_asset import (
     DataAsset,
     DataAssetParams,
     Source,
     ComputationSource,
 )
+from codeocean.error import Error as CodeOceanError
 from codeocean.models.folder import FolderItem
 
 
@@ -245,6 +252,55 @@ def detect_domain_from_git(
     return None
 
 
+# ---------------------------------------------------------------------------
+# App Panel lookup: "this capsule has no panel" vs "the lookup broke"
+# ---------------------------------------------------------------------------
+
+class AppPanelLookupError(RuntimeError):
+    """The App Panel *lookup* failed — we do not know what the capsule declares.
+
+    Deliberately distinct from "this capsule has no App Panel", which is a
+    genuine 404 and is reported by returning None. The difference matters a
+    lot to a caller that caches the answer: "no panel" is a permanent fact
+    about the capsule, while a 500 or a dropped connection is a transient
+    hiccup that must NOT be remembered as "this capsule has no parameters".
+    """
+
+
+#: Only used when an HTTP error carries no structured status code at all.
+#: Kept narrow on purpose — a connection error whose message happens to say
+#: "not known" must never be mistaken for a 404.
+_NOT_FOUND_TEXT_RE = re.compile(r"\b404\b|not found", re.IGNORECASE)
+
+
+def http_status_code(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status code for an SDK/requests exception, else None.
+
+    ``codeocean.error.Error`` exposes ``.status_code`` directly (it copies it
+    off the wrapped ``requests.HTTPError``), but it also keeps the original as
+    ``.http_err``; a plain ``requests.HTTPError`` only has ``.response``. Try
+    all three shapes rather than assuming one.
+    """
+    for attr_path in (
+        ("status_code",),                 # codeocean.error.Error
+        ("response", "status_code"),      # requests.HTTPError
+        ("http_err", "response", "status_code"),  # Error -> wrapped HTTPError
+    ):
+        value: object = exc
+        for attr in attr_path:
+            value = getattr(value, attr, None)
+            if value is None:
+                break
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _looks_like_not_found(exc: BaseException) -> bool:
+    """Last-resort 404 detection from an HTTP error's message text."""
+    return bool(_NOT_FOUND_TEXT_RE.search(str(exc)))
+
+
 def computation_succeeded(comp: Computation) -> bool:
     """Contract completion check: state == "completed" AND exit_code in (0, None).
 
@@ -259,6 +315,29 @@ def computation_failed(comp: Computation) -> bool:
     if comp.state == "failed":
         return True
     return comp.state == "completed" and comp.exit_code not in (0, None)
+
+
+def build_named_run_params(
+    named_parameters: Optional[Dict[str, object]],
+) -> Optional[List[NamedRunParam]]:
+    """Turn ``{param_name: value}`` into the SDK's named-parameter list.
+
+    Code Ocean's *named parameters* are how a GUI choice becomes part of the
+    provenance record: the backend appends each one to the capsule's ``code/run``
+    as a single ``--param_name=value`` argv token, stores them on the
+    Computation, and freezes them onto any data asset captured from that run as
+    ``app_parameters``. Values are always sent as strings.
+
+    Returns None (not an empty list) when there is nothing to send, so the
+    caller can leave the field off RunParams entirely and keep unparameterized
+    runs byte-identical to a call that never knew about parameters.
+    """
+    if not named_parameters:
+        return None
+    return [
+        NamedRunParam(param_name=str(name), value=str(value))
+        for name, value in named_parameters.items()
+    ]
 
 
 class Orchestrator:
@@ -291,6 +370,58 @@ class Orchestrator:
         )
         return list(results.results or [])
 
+    def get_app_panel(self, capsule_id: str) -> Optional[AppPanel]:
+        """Return the capsule's App Panel definition, or None if it has none.
+
+        A capsule's *App Panel* (committed as ``.codeocean/app-panel.json``) is
+        the capsule's own declaration of the parameters it accepts: each entry
+        has a ``name`` (label), ``param_name`` (argument key), ``type``
+        ("text"/"list"), ``default_value`` and, for lists, ``value_options``.
+        Reading it lets a caller build a parameter form *from the capsule*
+        instead of hardcoding one — add a parameter to the capsule and it
+        appears in the UI with no code change.
+
+        Two very different things can go wrong here, and the caller has to be
+        able to tell them apart:
+
+        * **404 — the capsule has no App Panel.** A permanent fact about the
+          capsule (panels are optional). Returns ``None``, meaning "no
+          parameters to offer, run the capsule with its own defaults".
+        * **Anything else** — a 500, an expired token, a DNS blip, a timeout,
+          an unexpected payload shape. Raises :class:`AppPanelLookupError`.
+
+        Collapsing the second case into ``None`` (as this used to) lets one
+        transient hiccup be recorded as "this capsule has no parameters", which
+        silently deletes the parameter form for the rest of the session.
+        """
+        try:
+            return self.client.capsules.get_capsule_app_panel(capsule_id)
+        except (CodeOceanError, requests.HTTPError) as exc:
+            # An HTTP-level failure: the server answered, so there is a status.
+            status = http_status_code(exc)
+            if status == 404:
+                return None
+            if status is None and _looks_like_not_found(exc):
+                # No structured status (odd SDK/proxy error shape) — only then
+                # is it worth reading the message text.
+                return None
+            raise AppPanelLookupError(
+                "App Panel lookup for capsule %s failed%s: %s"
+                % (capsule_id, " (HTTP %s)" % status if status else "", exc)
+            ) from exc
+        except requests.RequestException as exc:
+            # Connection reset, DNS failure, timeout: transient by nature and
+            # never evidence that the capsule lacks a panel.
+            raise AppPanelLookupError(
+                "App Panel lookup for capsule %s failed (no response): %s"
+                % (capsule_id, exc)
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — e.g. an unparseable payload.
+            raise AppPanelLookupError(
+                "App Panel lookup for capsule %s failed unexpectedly: %s"
+                % (capsule_id, exc)
+            ) from exc
+
     # ------------------------------------------------------------------ runs
 
     def run_capsule(
@@ -298,16 +429,27 @@ class Orchestrator:
         capsule_id: str,
         data_asset_id: Optional[str] = None,
         mount: Optional[str] = None,
+        named_parameters: Optional[Dict[str, object]] = None,
     ) -> Computation:
         """Start a capsule run, optionally mounting one data asset.
 
         The asset appears inside the capsule at ``/data/<mount>/``.
+        ``named_parameters`` is a plain ``{param_name: value}`` dict; it only
+        applies to capsules that expose an App Panel, and it is what makes GUI
+        choices show up in the run's provenance (see build_named_run_params).
+        When it is empty or None the field is left off RunParams entirely, so
+        an unparameterized run is exactly the call it always was.
+
         Returns immediately with the new Computation (state "initializing").
         """
         data_assets = None
         if data_asset_id:
             data_assets = [DataAssetsRunParam(id=data_asset_id, mount=mount)]
-        params = RunParams(capsule_id=capsule_id, data_assets=data_assets)
+        run_kwargs = {"capsule_id": capsule_id, "data_assets": data_assets}
+        run_params = build_named_run_params(named_parameters)
+        if run_params:
+            run_kwargs["named_parameters"] = run_params
+        params = RunParams(**run_kwargs)
         return self.client.computations.run_capsule(params)
 
     def wait_for_computation(

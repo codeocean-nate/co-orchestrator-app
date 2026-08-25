@@ -7,11 +7,36 @@ through the Code Ocean API:
 1. **▶ Start processing** — runs the [Excel→CSV capsule](https://github.com/codeocean-nate/co-orchestrator-step1-excel-to-csv)
    with the Excel data asset mounted and polls the computation live.
 2. Captures its `/results` as a **new data asset** ("✅ Data ready") and previews the CSV.
-3. **📊 Generate report** — runs the [reporting capsule](https://github.com/codeocean-nate/co-orchestrator-step2-html-report)
-   with that asset mounted, downloads `report.html`, renders it inline.
+3. **⚙️ Set report parameters** — the human-in-the-loop step. The app reads the
+   [reporting capsule](https://github.com/codeocean-nate/co-orchestrator-step2-html-report)'s
+   **App Panel** over the API and renders a form from it: title, region and category
+   filters, a date window, minimum revenue, top-N products, analyst notes.
+4. **📊 Generate report** — runs the reporting capsule with that asset mounted **and your
+   parameters attached to the run**, downloads `report.html`, renders it inline.
+5. Captures the report as a **result data asset** too (`Report — <ts>`), so the values you
+   chose are frozen onto it as `app_parameters` and the human decision becomes part of the
+   recorded provenance, next to the data it came from.
 
 An event log records every API interaction and an "Under the hood" expander shows the
 exact `codeocean` SDK call behind each step with the session's real IDs.
+
+## Report parameters
+
+The parameter form is not hardcoded here. The app calls
+`client.capsules.get_capsule_app_panel(<step 2 capsule>)` and renders one widget per
+parameter the capsule declares in its committed `.codeocean/app-panel.json` — **add a
+parameter to that capsule and push it, and the field appears in this GUI with no app
+change**. Your choices travel as *named run parameters* (each one reaching the capsule's
+`code/run` as a single `--param_name=value` argument), which is what gets them recorded on
+the computation and frozen onto the captured report asset as `app_parameters`.
+
+Two documented limits apply to free-text values: **no single quotes** (Code Ocean's
+parameter escaping does not support them, so the app substitutes a typographic apostrophe
+`’`), and **keep values short** (the app caps free text at 2,000 characters). Only values
+that differ from the panel's default are sent, so an untouched form runs the capsule
+exactly as it runs with no parameters at all. If the capsule has no App Panel the app says
+so and runs step 2 with the capsule's own defaults; if the lookup itself fails there is a
+**🔄 Retry parameter lookup** button. See [SETUP.md](SETUP.md#troubleshooting).
 
 ## Setting it up on your deployment
 

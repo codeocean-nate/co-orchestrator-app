@@ -4,8 +4,13 @@ Demonstrates chaining two Code Ocean capsules through the public SDK:
 
     1. Run the "Excel -> CSV" capsule with an Excel data asset mounted.
     2. Capture that computation's /results as a new (result) data asset.
-    3. Run the "CSV -> HTML report" capsule with the new asset mounted.
-    4. Download and display the self-contained HTML report.
+    3. Human in the loop: read the report capsule's OWN App Panel over the API
+       and render one widget per parameter it declares.
+    4. Run the "CSV -> HTML report" capsule with the new asset mounted and those
+       choices sent as *named run parameters*.
+    5. Capture that run's /results too, so the report becomes a lineage node
+       carrying the parameters as ``app_parameters``.
+    6. Download and display the self-contained HTML report.
 
 This file is named ``streamlit_app.py`` because Code Ocean's Streamlit Cloud
 Workstation looks for exactly ``/code/streamlit_app.py``.
@@ -56,6 +61,24 @@ STAGE_ORDER = [
 
 IN_FLIGHT_STAGES = ("step1_running", "asset_creating", "step2_running")
 
+#: Session-state prefix for the widgets generated from the step-2 capsule's App
+#: Panel. Namespaced so a capsule parameter can never collide with a config key.
+PARAM_KEY_PREFIX = "param_"
+
+#: Hard cap on a free-text parameter value. Code Ocean keeps parameter values
+#: on the computation record and freezes them onto the captured asset, and a
+#: multi-MB value has degraded a deployment before — so the form refuses to be
+#: the thing that sends one.
+PARAM_MAX_CHARS = 2000
+
+#: Code Ocean's parameter escaping backslash-escapes ``"`` and ``$`` and then
+#: shell-quotes each value; **single quotes are unsupported**.
+#: "Reviewed by the QC team's lead" is exactly the sort of thing a presenter
+#: types, so the form quietly swaps in the typographic apostrophe — which is
+#: immune to the quoting rule and reads better anyway — and says that it did.
+STRAIGHT_APOSTROPHE = "'"
+TYPOGRAPHIC_APOSTROPHE = "’"
+
 STATE_DEFAULTS = {
     "stage": "idle",
     "event_log": [],
@@ -69,11 +92,38 @@ STATE_DEFAULTS = {
     "csv_name": None,
     "report_html": None,
     "last_error": None,
+    # --- mid-pipeline parameters + step-2 result capture ---
+    # (none of these may start with PARAM_KEY_PREFIX — that namespace belongs
+    # to the generated widgets and is wiped on reset)
+    # Only SUCCESSFUL lookups land here: {capsule_id: AppPanel or None}, where
+    # None means "the capsule genuinely has no panel (404)". A failed lookup is
+    # never cached — see cached_app_panel().
+    "app_panel_cache": {},
+    "form_values": {},        # {param_name: value} currently shown in the form
+    "step2_params": {},       # {param_name: value} actually sent to step 2
+    "retry_warning": None,    # set when a parameterized run had to be retried
+    "step2_retried": False,   # the one-shot unparameterized retry is spent
+    "panel_logged": set(),    # panel notes already logged (keeps the log clean)
+    "report_asset_id": None,  # result data asset captured from step 2
+    "report_asset_name": None,
+    "capture_warning": None,  # set when the (non-fatal) capture failed
 }
+
+
+def _fresh(default):
+    """A private copy of a STATE_DEFAULTS value (mutables must not be shared)."""
+    if isinstance(default, list):
+        return list(default)
+    if isinstance(default, dict):
+        return dict(default)
+    if isinstance(default, set):
+        return set(default)
+    return default
+
 
 for _key, _default in STATE_DEFAULTS.items():
     if _key not in st.session_state:
-        st.session_state[_key] = list(_default) if isinstance(_default, list) else _default
+        st.session_state[_key] = _fresh(_default)
 
 
 def stage_idx(stage=None):
@@ -89,10 +139,29 @@ def log_event(message):
     st.session_state.event_log.append("%s UTC — %s" % (now_utc().strftime("%H:%M:%S"), message))
 
 
+def log_once(message):
+    """log_event(), but only the first time this exact message shows up.
+
+    Streamlit reruns the whole script on every keystroke, so anything logged
+    from a render path (rather than from a click) would otherwise repeat
+    forever. Cleared by "Reset demo" along with the rest of the state.
+    """
+    if message in st.session_state.panel_logged:
+        return
+    st.session_state.panel_logged.add(message)
+    log_event(message)
+
+
 def set_snippet(title, code):
     """Remember the SDK snippet equivalent to the last action ('Under the hood')."""
     st.session_state.snippet_title = title
     st.session_state.snippet = code
+
+
+def _brief(exc, limit=220):
+    """A one-line, truncated exception message (SDK errors embed a JSON dump)."""
+    text = " ".join(str(exc).split())
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +273,7 @@ def get_client():
 with st.sidebar.expander("🔎 Find a capsule ID by name"):
     st.caption("Uses `client.capsules.search_capsules` — handy for grabbing UUIDs.")
     lookup_query = st.text_input("Capsule name contains…", key="cfg_lookup")
-    if st.button("Search capsules", use_container_width=True, key="btn_lookup",
+    if st.button("Search capsules", width="stretch", key="btn_lookup",
                  disabled=not (domain and token and lookup_query.strip())):
         try:
             matches = get_client().search_capsules(lookup_query.strip(), limit=8)
@@ -216,12 +285,16 @@ with st.sidebar.expander("🔎 Find a capsule ID by name"):
             st.error("Search failed: %s" % exc)
 
 st.sidebar.divider()
-if st.sidebar.button("♻️ Reset demo", use_container_width=True):
+if st.sidebar.button("♻️ Reset demo", width="stretch"):
     # Clear pipeline state but keep the configuration inputs. Note: resetting
     # while a computation is mid-flight abandons *tracking* only — the
     # computation itself keeps running (and finishes) in Code Ocean.
     for key, default in STATE_DEFAULTS.items():
-        st.session_state[key] = list(default) if isinstance(default, list) else default
+        st.session_state[key] = _fresh(default)
+    # Also drop the App Panel widget values, so the parameter form comes back
+    # showing the capsule's own defaults.
+    for key in [k for k in st.session_state if str(k).startswith(PARAM_KEY_PREFIX)]:
+        del st.session_state[key]
     st.rerun()
 st.sidebar.caption("Resets pipeline progress; configuration is kept.")
 
@@ -274,16 +347,327 @@ if not config_ok:
         "capsule IDs, and the input data asset ID in the sidebar to start the demo."
     )
 
+# ---------------------------------------------------------------------------
+# Mid-pipeline parameters — the human-in-the-loop step between "data ready"
+# and "generate report".
+#
+# The form is NOT hardcoded here. The app asks Code Ocean what the step-2
+# capsule accepts (`client.capsules.get_capsule_app_panel`) and renders one
+# widget per parameter the capsule declares in its committed
+# `.codeocean/app-panel.json`. The values are then sent as *named run
+# parameters*, which is what makes a GUI choice part of the provenance record:
+# Code Ocean stores them on the computation and freezes them onto any data
+# asset captured from that run as `app_parameters`.
+# ---------------------------------------------------------------------------
+
+def param_type(param):
+    """A panel parameter's type as a plain lowercase string ("text"/"list"/"file")."""
+    value = getattr(param, "type", None)
+    value = getattr(value, "value", value)  # AppPanelParameterType -> "list"
+    return str(value or "").lower()
+
+
+def param_is_hidden(param):
+    """True when the capsule marked this parameter ``"hidden": true``.
+
+    A hidden parameter is one the capsule author deliberately kept out of the
+    App Panel UI (a debug switch, an internal path). Code Ocean's own panel
+    does not show it, so neither does this form — rendering it as an editable
+    widget would invite an operator to change something the capsule author
+    chose to hide, and would then send it as a named run parameter.
+    """
+    return bool(getattr(param, "hidden", False))
+
+
+def panel_parameters(panel):
+    """Every usable parameter an App Panel declares (never raises).
+
+    Two kinds of junk are filtered out here, because this is the one place
+    every caller goes through:
+
+    * entries without a `param_name` — that field is the argument key, so
+      without it there is nothing to send as a named run parameter;
+    * duplicate `param_name`s — a hand-edited `app-panel.json` can declare the
+      same key twice, and rendering two widgets with the same key crashes the
+      page with StreamlitDuplicateElementKey. First one wins (that is also what
+      a `--key=a --key=b` argv would leave argparse holding).
+    """
+    if panel is None:
+        return []
+    declared = getattr(panel, "parameters", None) or []
+    usable = []
+    seen = set()
+    for param in declared:
+        param_name = getattr(param, "param_name", None)
+        if not param_name:
+            continue
+        if param_name in seen:
+            log_once("app panel declares param_name `%s` more than once — keeping "
+                     "the first and ignoring the duplicate" % param_name)
+            continue
+        seen.add(param_name)
+        usable.append(param)
+    return usable
+
+
+def cached_app_panel(capsule_id):
+    """Look up a capsule's App Panel; returns ``(panel, error_message)``.
+
+    Streamlit reruns this script top-to-bottom on every interaction, so a
+    lookup that got an *answer* is memoised in session_state instead of
+    repeating on every rerun. ``panel is None`` with no error means the capsule
+    genuinely has no App Panel (a 404) — a real answer, worth caching.
+
+    A **failed** lookup (500, expired token, network blip) is deliberately NOT
+    cached and returns ``(None, "message")``. Caching it would remember one
+    transient hiccup as "this capsule has no parameters" for the rest of the
+    session, silently deleting the human-in-the-loop step with no way back
+    short of a full reset.
+    """
+    cache = st.session_state.app_panel_cache
+    if capsule_id in cache:
+        return cache[capsule_id], None
+    try:
+        panel = get_client().get_app_panel(capsule_id)
+    except Exception as exc:  # noqa: BLE001 — never a raw traceback on the page
+        message = _brief(exc)
+        log_once("get_capsule_app_panel(%s) FAILED — not cached, retryable: %s"
+                 % (capsule_id, message))
+        return None, message
+    cache[capsule_id] = panel
+    log_once("get_capsule_app_panel(%s) → %s" % (
+        capsule_id,
+        "%d parameter(s)" % len(panel_parameters(panel)) if panel else "no app panel",
+    ))
+    return panel, None
+
+
+def sanitize_param_value(value):
+    """Make a free-text value safe for Code Ocean's parameter escaping.
+
+    The backend backslash-escapes `"` and `$` and then shell-quotes each value,
+    and single quotes are unsupported — so a typed `'` becomes `’`. Everything
+    else (spaces, punctuation, unicode) travels fine.
+    """
+    return str(value).replace(STRAIGHT_APOSTROPHE, TYPOGRAPHIC_APOSTROPHE)
+
+
+def render_parameter_form():
+    """Render the step-2 capsule's parameters; return what to actually send.
+
+    The returned dict holds only the parameters whose value **differs from the
+    capsule's own default**. Sending an untouched default would be a lie in the
+    provenance record: the capsule (and its report) distinguishes "the user
+    chose this" from "nobody said, so I used my default", and `app_parameters`
+    should show the same thing.
+
+    Two declared parameter kinds are skipped rather than rendered: ones marked
+    ``"hidden": true`` (Code Ocean's own panel does not show them either) and
+    ones of type ``file`` (which need a data-asset file browser, not a text
+    box). Neither is drawn and neither is sent, so the capsule applies its own
+    default — the form says so in both cases rather than quietly omitting them.
+
+    Returns {} when the step is not active, the config is incomplete, the panel
+    lookup failed, or the capsule declares no parameters — in which case step 2
+    simply runs with the capsule's own defaults, exactly as it did before this
+    step existed.
+    """
+    if st.session_state.stage != "asset_ready" or not config_ok:
+        return {}
+
+    st.subheader("⚙️ Report parameters")
+    st.caption(
+        "These are the **step-2 capsule's own** App Panel parameters, discovered "
+        "over the API with `client.capsules.get_capsule_app_panel(...)` — nothing "
+        "here is hardcoded in this app, so adding a parameter to the capsule makes "
+        "it appear here. Your choices are sent as *named run parameters*, which is "
+        "how Code Ocean records them on the run and freezes them onto the captured "
+        "report asset as `app_parameters`."
+    )
+
+    panel, panel_error = cached_app_panel(step2_capsule_id)
+    if panel_error:
+        # NOT the same as "this capsule has no parameters" — we simply did not
+        # get an answer, and nothing has been cached, so a retry may well work.
+        st.warning(
+            "⚠️ **The App Panel lookup failed** — this does *not* mean the capsule "
+            "has no parameters, only that Code Ocean did not answer: `%s`. Nothing "
+            "was cached, so retrying is worth a try. Generating the report right now "
+            "would run step 2 unparameterized." % panel_error
+        )
+        if st.button("🔄 Retry parameter lookup", key="btn_retry_panel"):
+            # Defensive: failures are never cached, but a stale entry for this
+            # capsule (e.g. from an earlier answer) must not shadow the retry.
+            st.session_state.app_panel_cache.pop(step2_capsule_id, None)
+            st.session_state.panel_logged = set()
+            st.rerun()
+        return {}
+
+    params = panel_parameters(panel)
+    if not params:
+        st.info(
+            "ℹ️ This capsule exposes no App Panel parameters, so there is nothing to "
+            "fill in — the report will run with the capsule's own defaults."
+        )
+        return {}
+
+    # Two kinds of declared parameter are deliberately NOT turned into widgets.
+    renderable, hidden_names, file_names = [], [], []
+    for param in params:
+        if param_is_hidden(param):
+            hidden_names.append(param.param_name)
+        elif param_type(param) == "file":
+            file_names.append(param.param_name)
+        else:
+            renderable.append(param)
+
+    values = {}       # everything the form currently shows
+    defaults = {}     # the capsule's own default, in the same shape as `values`
+    substituted = []  # params whose apostrophes we had to swap
+    # Widget state normally persists on its own, but Streamlit drops the state
+    # of widgets that were not rendered on the previous run — so the last
+    # choices are also mirrored here and used as the widget defaults.
+    remembered = st.session_state.form_values
+    with st.container(border=True):
+        if renderable:
+            cols = st.columns(2)
+        for i, param in enumerate(renderable):
+            # Widget keys are namespaced so the values survive every rerun in
+            # st.session_state without colliding with the config inputs.
+            key = PARAM_KEY_PREFIX + param.param_name
+            label = getattr(param, "name", None) or param.param_name
+            help_text = (getattr(param, "description", None)
+                         or getattr(param, "help_text", None))
+            capsule_default = param.default_value if param.default_value is not None else ""
+            default = remembered.get(param.param_name, capsule_default)
+            options = list(getattr(param, "value_options", None) or [])
+            with cols[i % 2]:
+                if param_type(param) == "list" and options:
+                    # A list value comes from the capsule's own value_options,
+                    # so it is left exactly as the capsule spelled it.
+                    #
+                    # A hand-edited panel can declare a default_value that is
+                    # not one of its own value_options (or none at all). A
+                    # dropdown cannot show a value it does not have, so it falls
+                    # back to the first option — and THAT is the baseline, not
+                    # the unreachable declared default. Comparing against the
+                    # declared default instead would make an untouched form
+                    # report options[0] as a human choice and freeze it onto the
+                    # captured asset as an `app_parameter` nobody picked.
+                    shown_default = (capsule_default if capsule_default in options
+                                     else options[0])
+                    if shown_default != capsule_default:
+                        log_once(
+                            "app panel parameter `%s` declares default_value %r, which is "
+                            "not one of its value_options — the dropdown shows %r instead, "
+                            "and leaving it alone counts as untouched"
+                            % (param.param_name, capsule_default, shown_default))
+                    index = options.index(default if default in options
+                                          else shown_default)
+                    defaults[param.param_name] = shown_default
+                    values[param.param_name] = st.selectbox(
+                        label, options, index=index, key=key, help=help_text)
+                else:
+                    # Compare like with like: the default goes through the same
+                    # apostrophe swap the typed value does, so leaving a field
+                    # alone never counts as a change.
+                    defaults[param.param_name] = sanitize_param_value(capsule_default)
+                    raw = st.text_input(
+                        label,
+                        value=str(default)[:PARAM_MAX_CHARS],
+                        key=key,
+                        help=help_text,
+                        max_chars=PARAM_MAX_CHARS,
+                    )
+                    values[param.param_name] = sanitize_param_value(raw)
+                    if STRAIGHT_APOSTROPHE in raw:
+                        substituted.append(param.param_name)
+
+        if not renderable:
+            st.info(
+                "ℹ️ Every parameter this capsule declares is hidden or of an "
+                "unsupported type, so there is nothing to fill in — the report "
+                "will run with the capsule's own defaults."
+            )
+        if hidden_names:
+            # `"hidden": true` in app-panel.json. Code Ocean's own App Panel
+            # does not show these, so neither does this form.
+            st.caption(
+                "🙈 Hidden in the capsule's App Panel, so not shown here: %s. "
+                "The capsule applies its own default for each."
+                % ", ".join("`%s`" % name for name in hidden_names))
+            log_once("app panel for capsule %s marks %d parameter(s) hidden (%s) — "
+                     "not rendered" % (step2_capsule_id, len(hidden_names),
+                                       ", ".join(hidden_names)))
+        if file_names:
+            # type "file" means "pick a file from a mounted data asset". That
+            # needs a file browser, not a text box — a free-text path would
+            # just be a nice way to send a value the capsule cannot open.
+            st.caption(
+                "📎 File parameters are not supported by this demo form, so %s "
+                "%s skipped. The capsule applies its own default."
+                % (", ".join("`%s`" % name for name in file_names),
+                   "is" if len(file_names) == 1 else "are"))
+            log_once("app panel for capsule %s declares %d file parameter(s) (%s) — "
+                     "not supported by this demo form, skipped"
+                     % (step2_capsule_id, len(file_names), ", ".join(file_names)))
+
+        if renderable:
+            st.caption(
+                "Each value reaches the capsule's `code/run` as one `--param_name=value` "
+                "argument — no environment variables, no files. Free text is capped at "
+                "%s characters (a multi-MB parameter value has degraded a deployment "
+                "before), and a typed apostrophe `'` is sent as `’` because Code Ocean's "
+                "parameter escaping does not support single quotes."
+                % format(PARAM_MAX_CHARS, ",")
+            )
+        if substituted:
+            st.caption("✏️ Apostrophe replaced with `’` in: %s."
+                       % ", ".join("`%s`" % name for name in substituted))
+
+    # Remember every field (so the form redraws as the user left it) but send
+    # only what the user actually changed — see this function's docstring.
+    st.session_state.form_values = values
+    changed = {
+        name: value for name, value in values.items()
+        if value != defaults.get(name, "")
+    }
+    if not renderable:
+        # Nothing editable was drawn, so there is no "differs from the default"
+        # story to tell — the notes above already explain why.
+        return changed
+    if changed:
+        st.caption(
+            "▶ %d of %d parameter(s) differ from the capsule's defaults and will be "
+            "sent as named run parameters: %s. Untouched fields are left out entirely, "
+            "so the capsule uses — and reports — its own defaults."
+            % (len(changed), len(values), ", ".join("`%s`" % name for name in changed))
+        )
+    else:
+        st.caption(
+            "▶ Everything is still at the capsule's defaults, so **no** parameters will "
+            "be sent — the capsule falls back to its own values. Change a field to see "
+            "it travel into the run record as an `app_parameter`."
+        )
+    return changed
+
+
+# Rendered above the buttons so the human-in-the-loop step reads top-to-bottom:
+# data ready → choose parameters → generate report.
+report_params = render_parameter_form()
+
 btn_col1, btn_col2, _ = st.columns([1, 1, 2])
 start_clicked = btn_col1.button(
     "▶ Start processing",
     type="primary",
-    use_container_width=True,
+    width="stretch",
+    key="btn_start",
     disabled=(not config_ok) or st.session_state.stage != "idle",
 )
 report_clicked = btn_col2.button(
     "📊 Generate report",
-    use_container_width=True,
+    width="stretch",
+    key="btn_report",
     disabled=(not config_ok) or st.session_state.stage != "asset_ready",
 )
 
@@ -300,6 +684,13 @@ def _comp_progress_writer(label):
     def on_update(comp):
         st.write("`%s` — state: **%s**" % (comp.id, comp.state))
         log_event("%s: computation %s → %s" % (label, comp.id, comp.state))
+    return on_update
+
+
+def _asset_progress_writer():
+    def on_update(da):
+        st.write("`%s` — state: **%s**" % (da.id, da.state))
+        log_event("data asset %s → %s" % (da.id, da.state))
     return on_update
 
 
@@ -395,12 +786,8 @@ def capture_and_preview(orch, comp_id, existing_asset_id=None):
                     ) % (asset_name, comp_id, asset_id),
                 )
 
-            def _asset_update(da):
-                st.write("`%s` — state: **%s**" % (da.id, da.state))
-                log_event("data asset %s → %s" % (da.id, da.state))
-
             asset = orch.wait_for_data_asset(asset_id, poll_s=5, timeout_s=1800,
-                                             on_update=_asset_update)
+                                             on_update=_asset_progress_writer())
             if asset.state == "ready":
                 status.update(label="Data asset ready ✅", state="complete")
             else:
@@ -443,13 +830,189 @@ def capture_and_preview(orch, comp_id, existing_asset_id=None):
     st.rerun()
 
 
+def set_step2_snippet(params, comp_id, asset_name=None, asset_id=None):
+    """'Under the hood' for step 2: the real run + capture calls, real values.
+
+    Shows the two calls that carry the demo's whole point — the named
+    parameters that make GUI choices part of the run record, and the capture
+    that turns the report into a lineage node holding them.
+    """
+    if params:
+        named_block = (
+            "    named_parameters=[\n"
+            + "".join("        NamedRunParam(param_name=%r, value=%r),\n"
+                      % (name, str(value)) for name, value in params.items())
+            + "    ],\n"
+        )
+    else:
+        named_block = (
+            "    # no named_parameters — this capsule exposes no App Panel,\n"
+            "    # so it runs with its own defaults\n"
+        )
+    capture_name = asset_name or "Report — <YYYY-MM-DD HH:MM UTC>"
+    set_snippet(
+        "Step 2 — run the report capsule with parameters, then capture the result",
+        (
+            "from codeocean.computation import (\n"
+            "    RunParams, DataAssetsRunParam, NamedRunParam,\n"
+            ")\n"
+            "from codeocean.data_asset import (\n"
+            "    DataAssetParams, Source, ComputationSource,\n"
+            ")\n\n"
+            "comp = client.computations.run_capsule(RunParams(\n"
+            "    capsule_id=%r,\n"
+            "    data_assets=[DataAssetsRunParam(\n"
+            "        id=%r,   # the asset captured from step 1\n"
+            '        mount="processed-csv",\n'
+            "    )],\n"
+            "%s"
+            "))\n"
+            "# comp.id == %r ... poll until completed, then:\n"
+            'urls = client.computations.get_result_file_urls(comp.id, path="report.html")\n'
+            "html = requests.get(urls.download_url).content\n\n"
+            "# Capturing the results is what puts the report ON the lineage graph —\n"
+            "# the parameters above are frozen onto this asset as app_parameters.\n"
+            "asset = client.data_assets.create_data_asset(DataAssetParams(\n"
+            "    name=%r,\n"
+            '    mount="report",\n'
+            '    tags=["orchestrator-demo", "step2-output"],\n'
+            "    source=Source(computation=ComputationSource(id=comp.id)),\n"
+            "))\n"
+            "%s"
+        ) % (
+            step2_capsule_id,
+            st.session_state.asset_id,
+            named_block,
+            comp_id,
+            capture_name,
+            "# asset.id == %r\n" % asset_id if asset_id else "",
+        ),
+    )
+
+
+def capture_report_asset(orch, comp_id):
+    """Capture step 2's /results as a result data asset (NON-FATAL).
+
+    Downloading report.html only gives the user a file; *capturing* the results
+    is what makes the report a node in Code Ocean's lineage graph — with the
+    run's named parameters frozen onto it as `app_parameters`. If it fails the
+    demo carries on and still shows the report.
+
+    Resumable: the new asset id is stored in session_state the moment it
+    exists, so a re-entry after an interrupted poll waits on that asset instead
+    of creating a duplicate.
+    """
+    try:
+        with st.status("Capturing the report as a data asset…", expanded=True) as status:
+            existing_id = st.session_state.report_asset_id
+            if existing_id:
+                asset_id = existing_id
+                st.write("Resuming wait on report data asset `%s`" % asset_id)
+            else:
+                asset_name = "Report — %s" % now_utc().strftime("%Y-%m-%d %H:%M UTC")
+                asset = orch.capture_result_asset(
+                    comp_id,
+                    name=asset_name,
+                    mount="report",
+                    tags=["orchestrator-demo", "step2-output"],
+                )
+                asset_id = asset.id
+                st.session_state.report_asset_id = asset_id
+                st.session_state.report_asset_name = asset_name
+                st.write("Data asset `%s` created (state: **%s**) — waiting until ready"
+                         % (asset_id, asset.state))
+                log_event("create_data_asset from computation %s → report asset %s"
+                          % (comp_id, asset_id))
+                set_step2_snippet(st.session_state.step2_params, comp_id,
+                                  asset_name=asset_name, asset_id=asset_id)
+
+            asset = orch.wait_for_data_asset(asset_id, poll_s=5, timeout_s=1800,
+                                             on_update=_asset_progress_writer())
+            if asset.state == "ready":
+                status.update(label="Report captured as a data asset ✅", state="complete")
+                log_event("report data asset %s ready — parameters frozen as app_parameters"
+                          % asset_id)
+            else:
+                status.update(label="Report capture failed", state="error")
+                st.session_state.capture_warning = (
+                    "The report ran fine, but capturing it as a data asset ended in "
+                    "state `%s`%s — the report below is still complete, it just is "
+                    "not a lineage node." % (
+                        asset.state,
+                        " (%s)" % asset.failure_reason if asset.failure_reason else "")
+                )
+                log_event("report capture ended in state %s (non-fatal)" % asset.state)
+    except Exception as exc:  # noqa: BLE001 — capture is a bonus, never fatal
+        st.session_state.capture_warning = (
+            "The report ran fine, but capturing it as a data asset failed: %s. The "
+            "report below is still complete, it just is not a lineage node."
+            % _brief(exc)
+        )
+        log_event("report capture failed (non-fatal): %s" % _brief(exc))
+
+
+def step2_retry_available():
+    """True when the one-shot unparameterized fallback has not been used yet.
+
+    Two conditions, both required: the run that failed actually carried
+    parameters (otherwise dropping them changes nothing), and the fallback is
+    still unspent. `step2_retried` is what makes this a one-shot and never a
+    loop — it is set *before* the retry starts and only cleared by a fresh
+    "Generate report" click or a reset.
+    """
+    return bool(st.session_state.step2_params) and not st.session_state.step2_retried
+
+
+def retry_step2_without_parameters(orch, failed_comp_id):
+    """Re-run step 2 once with no parameters after a parameterized run failed.
+
+    Contract: "if a parameterized run is rejected, retry once without
+    parameters and say so in the log". A run that is *accepted* and then comes
+    back `failed` lands the demo in exactly the same hole, so it gets the same
+    single, loudly-logged fallback — and the retry itself runs unparameterized,
+    so it can never trigger another one.
+    """
+    spent_params = dict(st.session_state.step2_params)
+    st.session_state.step2_retried = True   # set FIRST: no second attempt, ever
+    st.session_state.step2_params = {}
+    log_event("step 2: computation %s FAILED carrying %d named parameter(s) (%s) — "
+              "retrying ONCE without parameters"
+              % (failed_comp_id, len(spent_params), ", ".join(spent_params)))
+    st.session_state.retry_warning = (
+        "The parameterized step-2 run (`%s`) came back **failed**, so it was retried "
+        "exactly once *without* parameters (%s). If this second run succeeds, the "
+        "capsule most likely choked on one of those values — its run log in Code "
+        "Ocean will say which. Note the report below therefore carries no "
+        "`app_parameters`." % (
+            failed_comp_id,
+            ", ".join("`%s=%s`" % (name, value) for name, value in spent_params.items()),
+        )
+    )
+    comp = None
+    try:
+        with st.status("Retrying step 2 without parameters…", expanded=True):
+            st.write("Re-running capsule `%s` with no named parameters" % step2_capsule_id)
+            comp = orch.run_capsule(step2_capsule_id,
+                                    data_asset_id=st.session_state.asset_id,
+                                    mount="processed-csv")
+            st.session_state.step2_comp_id = comp.id
+            log_event("step 2 retry: run_capsule(%s, no parameters) → computation %s"
+                      % (step2_capsule_id, comp.id))
+            set_step2_snippet({}, comp.id)
+    except Exception as exc:  # noqa: BLE001
+        _fail("Step 2 failed with parameters and the unparameterized retry could not "
+              "be started: %s" % _brief(exc), revert_stage="asset_ready")
+    continue_step2(orch, comp.id)
+
+
 def continue_step2(orch, comp_id, resuming=False):
-    """Poll the step-2 computation, then download report.html and finish."""
+    """Poll the step-2 computation, download report.html, capture, and finish."""
     st.session_state.stage = "step2_running"
     render_strip()
     label = ("Resuming step 2: generating HTML report…" if resuming
              else "Step 2: generating HTML report…")
     step2_error = None
+    retry_unparameterized = False
     try:
         with st.status(label, expanded=True) as status:
             comp2 = orch.wait_for_computation(
@@ -458,10 +1021,19 @@ def continue_step2(orch, comp_id, resuming=False):
             )
             if not computation_succeeded(comp2):
                 status.update(label="Step 2 failed", state="error")
-                step2_error = (
+                failure = (
                     "Step 2 computation `%s` ended with state `%s` (exit code: %s)."
                     % (comp2.id, comp2.state, comp2.exit_code)
                 )
+                if step2_retry_available():
+                    # The run was accepted but died. One of the parameter values
+                    # is the likeliest culprit, so give the demo one more shot
+                    # without them rather than dead-ending on a red box.
+                    retry_unparameterized = True
+                    st.write("⚠️ The parameterized run failed — retrying once "
+                             "without parameters…")
+                else:
+                    step2_error = failure
             else:
                 st.write("Locating `report.html` in the computation results…")
                 result_files = orch.list_results(comp2.id)
@@ -483,8 +1055,17 @@ def continue_step2(orch, comp_id, resuming=False):
         step2_error = "Step 2 timed out: %s" % exc
     except Exception as exc:  # noqa: BLE001
         step2_error = "Step 2 failed (computation: %s): %s" % (comp_id, exc)
+    if retry_unparameterized:
+        # Outside the st.status above, so the retry gets its own block. It ends
+        # in continue_step2() (with step2_params now empty, so no second retry).
+        retry_step2_without_parameters(orch, failed_comp_id=comp_id)
+        return
     if step2_error:
         _fail(step2_error, revert_stage="asset_ready")
+
+    # Lineage: capture the report's /results so the run's parameters live on as
+    # app_parameters on a real data asset. Non-fatal by design.
+    capture_report_asset(orch, comp_id)
 
     st.session_state.stage = "report_ready"
     log_event("stage → report_ready")
@@ -541,37 +1122,62 @@ if start_clicked:
 
 if report_clicked:
     st.session_state.last_error = None
+    st.session_state.retry_warning = None
+    st.session_state.capture_warning = None
+    st.session_state.report_asset_id = None
+    st.session_state.report_asset_name = None
+    # A fresh click is a fresh attempt, so the one-shot fallback is re-armed.
+    st.session_state.step2_retried = False
     orch = get_client()
 
     st.session_state.stage = "step2_running"
     render_strip()
     launch_error = None
     comp2 = None
+    # What we actually managed to send — the retry path below may empty it.
+    used_params = dict(report_params)
     try:
         with st.status("Launching step 2 capsule…", expanded=True):
             st.write("Launching capsule `%s` with data asset `%s` mounted at "
                      "`/data/processed-csv`" % (step2_capsule_id, st.session_state.asset_id))
-            comp2 = orch.run_capsule(step2_capsule_id,
-                                     data_asset_id=st.session_state.asset_id,
-                                     mount="processed-csv")
+            if used_params:
+                st.write("Named parameters: " + ", ".join(
+                    "`%s=%s`" % (name, value) for name, value in used_params.items()))
+            else:
+                st.write("No named parameters — every field was left at the capsule's "
+                         "own default, so there is nothing to override.")
+            try:
+                comp2 = orch.run_capsule(step2_capsule_id,
+                                         data_asset_id=st.session_state.asset_id,
+                                         mount="processed-csv",
+                                         named_parameters=used_params)
+            except Exception as exc:  # noqa: BLE001
+                # Named parameters only apply to capsules with an App Panel. If
+                # the deployment rejects them, fall back to the unparameterized
+                # run once rather than dead-ending the demo.
+                if not used_params:
+                    raise
+                log_event("step 2: parameterized run REJECTED (%s) — retrying once "
+                          "without parameters" % _brief(exc))
+                st.write("⚠️ Parameterized run rejected — retrying without parameters…")
+                # The one-shot fallback is now spent: the retry below carries no
+                # parameters, so a later failure must not trigger a second one.
+                st.session_state.step2_retried = True
+                st.session_state.retry_warning = (
+                    "The parameterized run was rejected (`%s`), so step 2 was retried "
+                    "without parameters. The step-2 capsule most likely has no App "
+                    "Panel on this deployment — run parameters only apply to capsules "
+                    "that commit a `.codeocean/app-panel.json`." % _brief(exc)
+                )
+                used_params = {}
+                comp2 = orch.run_capsule(step2_capsule_id,
+                                         data_asset_id=st.session_state.asset_id,
+                                         mount="processed-csv")
             st.session_state.step2_comp_id = comp2.id
-            log_event("step 2: run_capsule(%s) → computation %s" % (step2_capsule_id, comp2.id))
-            set_snippet(
-                "Step 2 — run the report capsule and download its output",
-                (
-                    "comp = client.computations.run_capsule(RunParams(\n"
-                    '    capsule_id="%s",\n'
-                    "    data_assets=[DataAssetsRunParam(\n"
-                    '        id="%s",         # the asset captured from step 1\n'
-                    '        mount="processed-csv",\n'
-                    "    )],\n"
-                    "))\n"
-                    "# comp.id == \"%s\" ... poll until completed, then:\n"
-                    "items = client.computations.list_computation_results(comp.id).items\n"
-                    "urls = client.computations.get_result_file_urls(comp.id, path=\"report.html\")\n"
-                    "html = requests.get(urls.download_url).content\n"
-                ) % (step2_capsule_id, st.session_state.asset_id, comp2.id),
-            )
+            st.session_state.step2_params = used_params
+            log_event("step 2: run_capsule(%s, %d named parameter(s)) → computation %s"
+                      % (step2_capsule_id, len(used_params), comp2.id))
+            set_step2_snippet(used_params, comp2.id)
     except Exception as exc:  # noqa: BLE001
         launch_error = "Could not start step 2: %s" % exc
     if launch_error:
@@ -619,6 +1225,9 @@ if st.session_state.stage in IN_FLIGHT_STAGES:
 if st.session_state.last_error:
     st.error("❌ " + st.session_state.last_error)
 
+if st.session_state.retry_warning:
+    st.warning("⚠️ " + st.session_state.retry_warning)
+
 if stage_idx() >= stage_idx("asset_ready") and st.session_state.asset_id:
     st.success("✅ Data ready — data asset `%s`  (*%s*)"
                % (st.session_state.asset_id, st.session_state.asset_name or ""))
@@ -626,18 +1235,47 @@ if stage_idx() >= stage_idx("asset_ready") and st.session_state.asset_id:
 if stage_idx() >= stage_idx("asset_ready") and st.session_state.csv_df is not None:
     st.subheader("Processed CSV preview")
     df = st.session_state.csv_df
-    st.dataframe(df.head(50), use_container_width=True)
+    st.dataframe(df.head(50), width="stretch")
     st.caption("`%s` — %s rows × %s columns (showing first 50). "
                "This file now lives in data asset `%s`."
                % (st.session_state.csv_name, format(len(df), ","),
                   len(df.columns), st.session_state.asset_id))
 
 if st.session_state.stage == "asset_ready":
-    st.info("👆 The processed data is captured as a versioned data asset. "
-            "Click **📊 Generate report** to feed it into the reporting capsule.")
+    st.info("👆 The processed data is captured as a versioned data asset. Set the "
+            "**⚙️ Report parameters** above, then click **📊 Generate report** to "
+            "feed the asset and your choices into the reporting capsule.")
 
 if st.session_state.stage == "report_ready" and st.session_state.report_html:
     st.subheader("📈 Generated report")
+
+    if st.session_state.report_asset_id and not st.session_state.capture_warning:
+        st.success("📦 Report captured as data asset `%s`%s"
+                   % (st.session_state.report_asset_id,
+                      "  (*%s*)" % st.session_state.report_asset_name
+                      if st.session_state.report_asset_name else ""))
+        if st.session_state.step2_params:
+            st.caption(
+                "The %d parameter(s) you chose are now **frozen onto that asset** as "
+                "`app_parameters` (%s) — open the asset in Code Ocean and its "
+                "Provenance box shows the exact run, the mounted CSV asset, and these "
+                "values. That is the payoff of routing GUI choices through Code Ocean "
+                "instead of keeping them in Streamlit."
+                % (len(st.session_state.step2_params),
+                   ", ".join("`%s=%s`" % (name, value)
+                             for name, value in st.session_state.step2_params.items()))
+            )
+        else:
+            st.caption(
+                "The run carried no parameters — either the capsule exposes none or "
+                "every field was left at its default, and a default is the capsule's "
+                "to apply, not ours to send. The asset still records its own "
+                "provenance: the capsule, the commit, and the CSV asset that was "
+                "mounted into the run."
+            )
+    if st.session_state.capture_warning:
+        st.warning("⚠️ " + st.session_state.capture_warning)
+
     html_str = st.session_state.report_html.decode("utf-8", errors="replace")
     components.html(html_str, height=900, scrolling=True)
     st.download_button(

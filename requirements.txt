@@ -1,4 +1,8 @@
-streamlit>=1.50
+# Streamlit ships breaking API removals in 1.x MINOR releases (the
+# container-width booleans are slated to go after 2025-12-31). A <2.0 ceiling
+# does not prevent that — it only stops a 2.x jump — so if a freshly built
+# environment ever breaks here, pin an exact version you have tested.
+streamlit>=1.50,<2.0
 codeocean>=0.16,<0.17
 pandas>=2.0
 requests>=2.31
