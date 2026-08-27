@@ -25,8 +25,8 @@ names below match that SDK exactly:
   (``.items`` of FolderItem with ``.name .path .type .size``)
 * ``client.computations.get_result_file_urls(id, path) -> FileURLs``
   (``.download_url`` is a presigned URL; fetch it with requests)
-* ``client.capsules.get_capsule_app_panel(id) -> AppPanel`` (404 = no panel;
-  any other failure raises AppPanelLookupError — see get_app_panel)
+* ``client.capsules.get_capsule_app_panel(id) -> AppPanel`` (unused by this demo:
+  no capsule here has a panel — see get_app_panel)
 """
 
 from __future__ import annotations
@@ -373,13 +373,16 @@ class Orchestrator:
     def get_app_panel(self, capsule_id: str) -> Optional[AppPanel]:
         """Return the capsule's App Panel definition, or None if it has none.
 
-        A capsule's *App Panel* (committed as ``.codeocean/app-panel.json``) is
-        the capsule's own declaration of the parameters it accepts: each entry
-        has a ``name`` (label), ``param_name`` (argument key), ``type``
-        ("text"/"list"), ``default_value`` and, for lists, ``value_options``.
-        Reading it lets a caller build a parameter form *from the capsule*
-        instead of hardcoding one — add a parameter to the capsule and it
-        appears in the UI with no code change.
+        **This demo does not use it, and neither should you for this purpose.**
+        A panel is created in Code Ocean's App Builder (or by Aqua); it cannot
+        be shipped in a repo. Committing ``.codeocean/app-panel.json`` creates
+        no panel and makes every run of that capsule fail with ``403 corrupted
+        object files``, so no capsule here has a panel and this call always
+        returns ``None`` for them. Kept only as a convenience for a capsule
+        that genuinely has a panel built in the UI.
+
+        You do not need a panel to send parameters: named run parameters reach
+        a panel-less capsule perfectly well (see ``run_capsule``).
 
         Two very different things can go wrong here, and the caller has to be
         able to tell them apart:
@@ -434,9 +437,11 @@ class Orchestrator:
         """Start a capsule run, optionally mounting one data asset.
 
         The asset appears inside the capsule at ``/data/<mount>/``.
-        ``named_parameters`` is a plain ``{param_name: value}`` dict; it only
-        applies to capsules that expose an App Panel, and it is what makes GUI
-        choices show up in the run's provenance (see build_named_run_params).
+        ``named_parameters`` is a plain ``{param_name: value}`` dict, and it is
+        what makes GUI choices show up in the run's provenance (see
+        build_named_run_params). It does **not** require an App Panel: verified
+        on a live deployment, a panel-less capsule received
+        ``--resample_interval=1D`` on argv and changed its output accordingly.
         When it is empty or None the field is left off RunParams entirely, so
         an unparameterized run is exactly the call it always was.
 

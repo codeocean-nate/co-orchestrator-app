@@ -4,8 +4,8 @@ Demonstrates chaining two Code Ocean capsules through the public SDK:
 
     1. Run the "Excel -> CSV" capsule with an Excel data asset mounted.
     2. Capture that computation's /results as a new (result) data asset.
-    3. Human in the loop: read the report capsule's OWN App Panel over the API
-       and render one widget per parameter it declares.
+    3. Human in the loop: render a parameter form from this app's own spec
+       (PARAM_SPECS below), which mirrors the report capsule's PARAM_SPECS.
     4. Run the "CSV -> HTML report" capsule with the new asset mounted and those
        choices sent as *named run parameters*.
     5. Capture that run's /results too, so the report becomes a lineage node
@@ -61,8 +61,8 @@ STAGE_ORDER = [
 
 IN_FLIGHT_STAGES = ("step1_running", "asset_creating", "step2_running")
 
-#: Session-state prefix for the widgets generated from the step-2 capsule's App
-#: Panel. Namespaced so a capsule parameter can never collide with a config key.
+#: Session-state prefix for the step-2 parameter widgets. Namespaced so a
+#: capsule parameter can never collide with a config key.
 PARAM_KEY_PREFIX = "param_"
 
 #: Hard cap on a free-text parameter value. Code Ocean keeps parameter values
@@ -79,6 +79,56 @@ PARAM_MAX_CHARS = 2000
 STRAIGHT_APOSTROPHE = "'"
 TYPOGRAPHIC_APOSTROPHE = "’"
 
+
+class ParamSpec(object):
+    """One run parameter this app offers for the report capsule.
+
+    Deliberately defined HERE rather than read from the capsule. Code Ocean's
+    App Panel cannot be shipped in a repo: a committed
+    ``.codeocean/app-panel.json`` never creates a panel, and its mere presence
+    makes every run of that capsule fail with
+    ``403 corrupted object files``. Named run parameters, on the other hand,
+    reach a capsule that has no panel at all — verified on a live deployment,
+    where a panel-less capsule received ``--resample_interval=1D`` on argv and
+    changed its output accordingly. So the form is app-side and the values
+    travel as named parameters.
+
+    Keep this list in step with ``PARAM_SPECS`` in the report capsule's
+    ``code/make_report.py``: same ``param_name``s, same defaults.
+    """
+
+    def __init__(self, param_name, name, default_value, description,
+                 value_options=None):
+        self.param_name = param_name
+        self.name = name
+        self.default_value = default_value
+        self.description = description
+        self.value_options = value_options or []
+        self.type = "list" if value_options else "text"
+
+
+#: Mirrors capsule-step2-html-report/code/make_report.py PARAM_SPECS.
+PARAM_SPECS = [
+    ParamSpec("report_title", "Report title", "Sales Performance Report",
+              "Heading printed at the top of the report."),
+    ParamSpec("regions", "Regions", "All",
+              "Comma-separated region names, or All. Matching is case-insensitive."),
+    ParamSpec("categories", "Categories", "All",
+              "Comma-separated categories, or All. Matching is case-insensitive."),
+    ParamSpec("date_from", "Start date", "",
+              "YYYY-MM-DD. Blank means start at the earliest row."),
+    ParamSpec("date_to", "End date", "",
+              "YYYY-MM-DD. Blank means run to the latest row."),
+    ParamSpec("min_revenue", "Minimum revenue per transaction", "0",
+              "Numeric. 0 keeps every row."),
+    ParamSpec("top_n", "Top N products", "10",
+              "How many rows in the top-products table. The capsule accepts 1-1000; "
+              "this form offers the common choices.",
+              value_options=["5", "10", "15", "20", "25"]),
+    ParamSpec("analyst_notes", "Analyst notes", "",
+              "Free text shown on the report."),
+]
+
 STATE_DEFAULTS = {
     "stage": "idle",
     "event_log": [],
@@ -94,16 +144,12 @@ STATE_DEFAULTS = {
     "last_error": None,
     # --- mid-pipeline parameters + step-2 result capture ---
     # (none of these may start with PARAM_KEY_PREFIX — that namespace belongs
-    # to the generated widgets and is wiped on reset)
-    # Only SUCCESSFUL lookups land here: {capsule_id: AppPanel or None}, where
-    # None means "the capsule genuinely has no panel (404)". A failed lookup is
-    # never cached — see cached_app_panel().
-    "app_panel_cache": {},
+    # to the parameter widgets and is wiped on reset)
     "form_values": {},        # {param_name: value} currently shown in the form
     "step2_params": {},       # {param_name: value} actually sent to step 2
     "retry_warning": None,    # set when a parameterized run had to be retried
     "step2_retried": False,   # the one-shot unparameterized retry is spent
-    "panel_logged": set(),    # panel notes already logged (keeps the log clean)
+    "notes_logged": set(),    # notes already logged once (keeps the log clean)
     "report_asset_id": None,  # result data asset captured from step 2
     "report_asset_name": None,
     "capture_warning": None,  # set when the (non-fatal) capture failed
@@ -146,9 +192,9 @@ def log_once(message):
     from a render path (rather than from a click) would otherwise repeat
     forever. Cleared by "Reset demo" along with the rest of the state.
     """
-    if message in st.session_state.panel_logged:
+    if message in st.session_state.notes_logged:
         return
-    st.session_state.panel_logged.add(message)
+    st.session_state.notes_logged.add(message)
     log_event(message)
 
 
@@ -360,86 +406,11 @@ if not config_ok:
 # asset captured from that run as `app_parameters`.
 # ---------------------------------------------------------------------------
 
-def param_type(param):
-    """A panel parameter's type as a plain lowercase string ("text"/"list"/"file")."""
-    value = getattr(param, "type", None)
-    value = getattr(value, "value", value)  # AppPanelParameterType -> "list"
-    return str(value or "").lower()
-
-
-def param_is_hidden(param):
-    """True when the capsule marked this parameter ``"hidden": true``.
-
-    A hidden parameter is one the capsule author deliberately kept out of the
-    App Panel UI (a debug switch, an internal path). Code Ocean's own panel
-    does not show it, so neither does this form — rendering it as an editable
-    widget would invite an operator to change something the capsule author
-    chose to hide, and would then send it as a named run parameter.
-    """
-    return bool(getattr(param, "hidden", False))
-
-
-def panel_parameters(panel):
-    """Every usable parameter an App Panel declares (never raises).
-
-    Two kinds of junk are filtered out here, because this is the one place
-    every caller goes through:
-
-    * entries without a `param_name` — that field is the argument key, so
-      without it there is nothing to send as a named run parameter;
-    * duplicate `param_name`s — a hand-edited `app-panel.json` can declare the
-      same key twice, and rendering two widgets with the same key crashes the
-      page with StreamlitDuplicateElementKey. First one wins (that is also what
-      a `--key=a --key=b` argv would leave argparse holding).
-    """
-    if panel is None:
-        return []
-    declared = getattr(panel, "parameters", None) or []
-    usable = []
-    seen = set()
-    for param in declared:
-        param_name = getattr(param, "param_name", None)
-        if not param_name:
-            continue
-        if param_name in seen:
-            log_once("app panel declares param_name `%s` more than once — keeping "
-                     "the first and ignoring the duplicate" % param_name)
-            continue
-        seen.add(param_name)
-        usable.append(param)
-    return usable
-
-
-def cached_app_panel(capsule_id):
-    """Look up a capsule's App Panel; returns ``(panel, error_message)``.
-
-    Streamlit reruns this script top-to-bottom on every interaction, so a
-    lookup that got an *answer* is memoised in session_state instead of
-    repeating on every rerun. ``panel is None`` with no error means the capsule
-    genuinely has no App Panel (a 404) — a real answer, worth caching.
-
-    A **failed** lookup (500, expired token, network blip) is deliberately NOT
-    cached and returns ``(None, "message")``. Caching it would remember one
-    transient hiccup as "this capsule has no parameters" for the rest of the
-    session, silently deleting the human-in-the-loop step with no way back
-    short of a full reset.
-    """
-    cache = st.session_state.app_panel_cache
-    if capsule_id in cache:
-        return cache[capsule_id], None
-    try:
-        panel = get_client().get_app_panel(capsule_id)
-    except Exception as exc:  # noqa: BLE001 — never a raw traceback on the page
-        message = _brief(exc)
-        log_once("get_capsule_app_panel(%s) FAILED — not cached, retryable: %s"
-                 % (capsule_id, message))
-        return None, message
-    cache[capsule_id] = panel
-    log_once("get_capsule_app_panel(%s) → %s" % (
-        capsule_id,
-        "%d parameter(s)" % len(panel_parameters(panel)) if panel else "no app panel",
-    ))
-    return panel, None
+# NOTE: this app deliberately does NOT read a capsule's App Panel. Panels
+# cannot be shipped in a repo (a committed .codeocean/app-panel.json creates
+# no panel and makes every run of that capsule fail with 403 corrupted object
+# files), and named run parameters reach a panel-less capsule anyway. The
+# parameter list therefore lives in PARAM_SPECS at the top of this file.
 
 
 def sanitize_param_value(value):
@@ -461,65 +432,23 @@ def render_parameter_form():
     chose this" from "nobody said, so I used my default", and `app_parameters`
     should show the same thing.
 
-    Two declared parameter kinds are skipped rather than rendered: ones marked
-    ``"hidden": true`` (Code Ocean's own panel does not show them either) and
-    ones of type ``file`` (which need a data-asset file browser, not a text
-    box). Neither is drawn and neither is sent, so the capsule applies its own
-    default — the form says so in both cases rather than quietly omitting them.
-
-    Returns {} when the step is not active, the config is incomplete, the panel
-    lookup failed, or the capsule declares no parameters — in which case step 2
-    simply runs with the capsule's own defaults, exactly as it did before this
-    step existed.
+    Returns {} when the step is not active or the config is incomplete.
     """
     if st.session_state.stage != "asset_ready" or not config_ok:
         return {}
 
     st.subheader("⚙️ Report parameters")
     st.caption(
-        "These are the **step-2 capsule's own** App Panel parameters, discovered "
-        "over the API with `client.capsules.get_capsule_app_panel(...)` — nothing "
-        "here is hardcoded in this app, so adding a parameter to the capsule makes "
-        "it appear here. Your choices are sent as *named run parameters*, which is "
-        "how Code Ocean records them on the run and freezes them onto the captured "
-        "report asset as `app_parameters`."
+        "These are the report capsule's run parameters, declared in this app "
+        "(`PARAM_SPECS`) to mirror the capsule's own list. Your choices are sent as "
+        "*named run parameters* — each one reaching `code/run` as a single "
+        "`--param_name=value` argument — which is how Code Ocean records them on the "
+        "run and freezes them onto the captured report asset. The capsule needs no "
+        "App Panel for this: named parameters reach a panel-less capsule fine."
     )
 
-    panel, panel_error = cached_app_panel(step2_capsule_id)
-    if panel_error:
-        # NOT the same as "this capsule has no parameters" — we simply did not
-        # get an answer, and nothing has been cached, so a retry may well work.
-        st.warning(
-            "⚠️ **The App Panel lookup failed** — this does *not* mean the capsule "
-            "has no parameters, only that Code Ocean did not answer: `%s`. Nothing "
-            "was cached, so retrying is worth a try. Generating the report right now "
-            "would run step 2 unparameterized." % panel_error
-        )
-        if st.button("🔄 Retry parameter lookup", key="btn_retry_panel"):
-            # Defensive: failures are never cached, but a stale entry for this
-            # capsule (e.g. from an earlier answer) must not shadow the retry.
-            st.session_state.app_panel_cache.pop(step2_capsule_id, None)
-            st.session_state.panel_logged = set()
-            st.rerun()
-        return {}
-
-    params = panel_parameters(panel)
-    if not params:
-        st.info(
-            "ℹ️ This capsule exposes no App Panel parameters, so there is nothing to "
-            "fill in — the report will run with the capsule's own defaults."
-        )
-        return {}
-
-    # Two kinds of declared parameter are deliberately NOT turned into widgets.
-    renderable, hidden_names, file_names = [], [], []
-    for param in params:
-        if param_is_hidden(param):
-            hidden_names.append(param.param_name)
-        elif param_type(param) == "file":
-            file_names.append(param.param_name)
-        else:
-            renderable.append(param)
+    renderable = list(PARAM_SPECS)
+    hidden_names, file_names = [], []
 
     values = {}       # everything the form currently shows
     defaults = {}     # the capsule's own default, in the same shape as `values`
@@ -542,7 +471,7 @@ def render_parameter_form():
             default = remembered.get(param.param_name, capsule_default)
             options = list(getattr(param, "value_options", None) or [])
             with cols[i % 2]:
-                if param_type(param) == "list" and options:
+                if getattr(param, "type", "text") == "list" and options:
                     # A list value comes from the capsule's own value_options,
                     # so it is left exactly as the capsule spelled it.
                     #
@@ -1152,9 +1081,10 @@ if report_clicked:
                                          mount="processed-csv",
                                          named_parameters=used_params)
             except Exception as exc:  # noqa: BLE001
-                # Named parameters only apply to capsules with an App Panel. If
-                # the deployment rejects them, fall back to the unparameterized
-                # run once rather than dead-ending the demo.
+                # Named parameters DO reach a capsule with no App Panel — that is
+                # verified — so a rejection here means something else (an unknown
+                # param_name, or a deployment-side problem). Fall back to the
+                # unparameterized run once rather than dead-ending the demo.
                 if not used_params:
                     raise
                 log_event("step 2: parameterized run REJECTED (%s) — retrying once "
@@ -1165,9 +1095,11 @@ if report_clicked:
                 st.session_state.step2_retried = True
                 st.session_state.retry_warning = (
                     "The parameterized run was rejected (`%s`), so step 2 was retried "
-                    "without parameters. The step-2 capsule most likely has no App "
-                    "Panel on this deployment — run parameters only apply to capsules "
-                    "that commit a `.codeocean/app-panel.json`." % _brief(exc)
+                    "without parameters and used the capsule's own defaults. Named "
+                    "parameters do reach capsules that have no App Panel, so this is "
+                    "not a missing-panel problem — check that every `param_name` "
+                    "matches the capsule's `PARAM_SPECS`, and check the run log."
+                    % _brief(exc)
                 )
                 used_params = {}
                 comp2 = orch.run_capsule(step2_capsule_id,

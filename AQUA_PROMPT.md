@@ -39,6 +39,14 @@ data assets from results, attach assets to capsules, and launch cloud workstatio
 cannot (and must not be asked to) handle secrets, create releases, or build pipeline
 DAGs — the one manual step for you is attaching your API token at the end.
 
+**One thing to keep Aqua away from:** a `.codeocean/app-panel.json` file. None of the
+four repos has one and none needs one — the app's report parameters are sent as *named
+run parameters*, which reach a capsule that has no App Panel. A capsule that does contain
+that file cannot be run at all; every run fails with `403 {"message":"corrupted object
+files","corrupted_object_files":[".codeocean/app-panel.json"]}`. Task 1's rules below
+tell Aqua not to create one. (If you want an App Panel in the UI for its own sake, build
+it in the **App Builder** afterwards and let Code Ocean write the file itself.)
+
 **If Aqua asks a clarifying question**, answer it and let it continue — that's normal.
 If a step fails twice, tell it what the error says; it's good at run→diagnose→fix loops
 when you let it retry.
@@ -53,7 +61,9 @@ task per message. General rules for the whole session: work autonomously and fix
 problems along the way (adjust pip packages or compute resources if a run fails);
 after each task, report the IDs of everything you created (capsule IDs and data asset
 IDs); do not create releases, do not build pipelines, and never touch secrets or
-tokens.
+tokens. Do not create a .codeocean/app-panel.json in any capsule and do not build an
+App Panel — a capsule containing that file cannot be run at all, and nothing in this
+demo needs one.
 
 Task 1 — create the demo's input data asset:
 1. Create a new capsule named "Orchestrator Demo — Data Seed" by cloning this public

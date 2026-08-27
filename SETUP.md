@@ -45,9 +45,9 @@ step.
                                   │
                                   ▼  the human-in-the-loop step
                        ┌──────────────────────────────────────────┐
-                       │ ⚙️  Report parameters, rendered from the  │
-                       │    step-2 capsule's own App Panel and    │
-                       │    sent as named parameters on the run   │
+                       │ ⚙️  Report parameters, chosen in the app  │
+                       │    and sent as named parameters on the   │
+                       │    step-2 run (no App Panel needed)      │
                        └─────────────────────┬────────────────────┘
                                              │ step 2 runs with them
                                              ▼
@@ -64,10 +64,10 @@ step.
    data asset mounted, and polls the computation live.
 2. When it completes, the app captures `/results` as a **new data asset** and polls it
    until **"✅ Data ready"**, then previews the CSV in a table.
-3. **⚙️ Set report parameters** — the human-in-the-loop step. The app reads the report
-   capsule's **App Panel** over the API and renders a form from it: title, region and
-   category filters, a date window, minimum revenue, top-N products, analyst notes.
-   Add a parameter to that capsule's panel and it appears here with no app change.
+3. **⚙️ Set report parameters** — the human-in-the-loop step. The app renders a form for
+   the report capsule: title, region and category filters, a date window, minimum
+   revenue, top-N products, analyst notes. The capsule needs no App Panel for this; the
+   values are sent as named run parameters on the run itself.
 4. Click **📊 Generate report** → the app runs the reporting capsule with the new asset
    mounted **and your parameters attached to the run**, polls it, downloads
    `report.html`, and renders it inline.
@@ -105,12 +105,32 @@ Prerequisites:
 |---|---|---|---|
 | Orchestrator Demo — Data Seed | https://github.com/codeocean-nate/co-orchestrator-data-seed | Python starter, **no packages** | Stages the bundled `sales_data.xlsx` into `/results` so you can create the input data asset by capturing a run |
 | Orchestrator Demo — Step 1: Excel to CSV | https://github.com/codeocean-nate/co-orchestrator-step1-excel-to-csv | Python starter + `pandas`, `openpyxl` | Converts every sheet of every mounted workbook to `/results/csv/*.csv` + `manifest.json` |
-| Orchestrator Demo — Step 2: HTML Report | https://github.com/codeocean-nate/co-orchestrator-step2-html-report | Python starter + `pandas`, `plotly` | Reads mounted CSVs, writes one fully self-contained `/results/report.html`. Its committed `.codeocean/app-panel.json` declares the report's run parameters — that file is what the app's **⚙️ Report parameters** form is built from |
+| Orchestrator Demo — Step 2: HTML Report | https://github.com/codeocean-nate/co-orchestrator-step2-html-report | Python starter + `pandas`, `plotly` | Reads mounted CSVs, writes one fully self-contained `/results/report.html`. Accepts the report's run parameters as `--param_name=value` argv, which is what the app's **⚙️ Report parameters** form sends |
 | Orchestrator Demo — App | https://github.com/codeocean-nate/co-orchestrator-app | Python starter + `streamlit`, `codeocean`, `pandas`, `requests` | The Streamlit UI that orchestrates the other two |
 
 Names are only a suggestion; nothing in the code depends on them. What *is* load-bearing:
 the app's entry point must stay at **`code/streamlit_app.py`** — that is the path Code
 Ocean's Streamlit Cloud Workstation serves.
+
+### Do not add an `app-panel.json`
+
+None of these repos contains a `.codeocean/app-panel.json`, and none of them should.
+Measured on a live deployment: a capsule holding a committed `.codeocean/app-panel.json`
+**cannot be run at all** — every run attempt fails with
+
+```
+403 {"message":"corrupted object files","corrupted_object_files":[".codeocean/app-panel.json"]}
+```
+
+Deleting the file makes the capsule runnable again. Committing it does not produce an App
+Panel either: App Builder still offers "Create App" and the capsule keeps a plain
+**Reproducible Run** button.
+
+The demo does not need one. The app's **⚙️ Report parameters** values are sent as *named
+run parameters* on the step-2 run, and named parameters reach a capsule that has no App
+Panel — verified, not a workaround. If you separately want an App Panel in the Code Ocean
+UI, build it in the **App Builder** (or ask Aqua to) and let Code Ocean write that file
+itself; that is optional and has nothing to do with the orchestrator app.
 
 ## Route A — let Aqua build it
 
@@ -123,10 +143,11 @@ Aqua will not touch secrets, so two things stay manual: [attaching your API
 token](#the-api-token) and, if the workstation was launched before the secret existed,
 relaunching it.
 
-Because Aqua creates the capsules from the repos, the step-2 capsule's
-`.codeocean/app-panel.json` arrives with the clone and its App Panel — the source of the
-app's **⚙️ Report parameters** form — materializes on its own. If that form turns out
-empty later, see [Troubleshooting](#troubleshooting).
+Nothing extra is needed for the app's **⚙️ Report parameters** form: the app defines
+those parameters itself and sends them as named run parameters, which reach the step-2
+capsule whether or not it has an App Panel. Aqua must not add a
+`.codeocean/app-panel.json` to any capsule — see [Do not add an
+app-panel.json](#do-not-add-an-app-paneljson).
 
 Then skip to [Run the demo](#run-the-demo).
 
@@ -192,19 +213,13 @@ This rehearses the exact hand-off the app performs at demo time.
    [step2] wrote /results/report.html (4.9 MB)
    [step2] wrote /results/manifest.json
    ```
-4. **Confirm the capsule's App Panel materialized.** The app's **⚙️ Report parameters**
-   form is rendered from this capsule's panel, and that panel exists only once
-   `.codeocean/app-panel.json` has been pushed into the capsule — cloning from Git brings
-   the file along, but it is read-only in the capsule IDE, so it can never be created
-   there. Check it either way:
-   - **API**: `client.capsules.get_capsule_app_panel(<STEP2_CAPSULE_ID>)` returns a panel
-     listing the eight report parameters; a 404 means the capsule has none.
-   - **UI**: open the capsule's **Reproducibility Panel** — the parameter fields (Report
-     title, Regions, Categories, …) are shown there next to the run controls.
-
-   If it is missing, re-push the capsule's code with the `.codeocean/` directory included
-   and give the capsule a moment to sync. Nothing breaks without it — step 2 just runs
-   with its own defaults — but the parameter step is the headline of the demo.
+4. **Confirm the parameters reach the code.** Nothing needs to be configured on the
+   capsule for this — the app sends the values as named run parameters and Code Ocean
+   appends them to `code/run`. To prove it end to end before demo time, run the capsule
+   once over the API with `named_parameters={"report_title": "Panel-free check",
+   "top_n": "5"}`: the run log echoes the arguments it received, the heading on
+   `report.html` changes, and the computation records the values. That capsule has no App
+   Panel, and it does not need one.
 5. **Detach the verification asset** from the capsule (again, keep the asset). At demo
    time the app mounts a freshly captured asset, and a leftover attachment can collide
    with it.
@@ -288,12 +303,13 @@ With the sidebar showing all five settings resolved:
 1. **▶ Start processing** — runs step 1 with the Excel asset mounted, polls it live,
    then automatically captures the results as a new data asset and polls that to ready.
 2. **✅ Data ready** appears with the new asset's ID, and the CSV preview renders.
-3. **⚙️ Report parameters** — the form above the buttons is the step-2 capsule's own App
-   Panel, fetched over the API. Set a report title, narrow the regions, categories or
-   date window, raise the minimum revenue, change top-N, type an analyst note. Leaving a
-   field at its default simply means that value is not sent. This is the moment to say
-   that nothing here is hardcoded in the app: the capsule declares the parameters, the
-   app renders whatever it declares.
+3. **⚙️ Report parameters** — the form above the buttons. Set a report title, narrow the
+   regions, categories or date window, raise the minimum revenue, change top-N, type an
+   analyst note. Leaving a field at its default simply means that value is not sent.
+   This is the moment to say what actually travels: each choice becomes a named run
+   parameter on the step-2 computation — a `--param_name=value` argument appended to the
+   capsule's `code/run` — so the GUI decision is recorded by Code Ocean rather than
+   living and dying inside Streamlit.
 4. **📊 Generate report** — runs step 2 with the new asset mounted *and those values
    attached as named run parameters*, downloads `report.html`, and renders it inline. A
    download button offers the file itself, and the report's **Report parameters** card
@@ -327,8 +343,8 @@ cloud workstations under the hood, so the deployment's idle timeout applies.
 | **Capsule not found** on ▶ Start processing | A slug was used instead of a UUID. `STEP1_CAPSULE_ID` / `STEP2_CAPSULE_ID` are UUIDs; use the sidebar's **🔎 Find a capsule ID by name** search to get them. |
 | Step 1 run "succeeds" but the report is generic, not the sales report | No Excel file was mounted, so step 1 fell back to synthetic data. Check `INPUT_DATA_ASSET_ID` points at the ready `Demo Sales Data (Excel)` asset. |
 | Step 2 run fails, or the report is only a few KB | The environment is missing `plotly` (or `pandas`). Fix the Environment Editor packages and rerun. |
-| The **⚙️ Report parameters** form is empty or missing | If the app says the capsule *exposes no App Panel parameters*, the panel really is absent: `.codeocean/app-panel.json` was never pushed (it is read-only in the capsule IDE, so it arrives only by Git clone or `git push`), or the capsule has not finished syncing that push. Re-push and confirm with `client.capsules.get_capsule_app_panel(<STEP2_CAPSULE_ID>)` — 404 means no panel. If instead the app warns that the *lookup failed*, Code Ocean simply did not answer; press **🔄 Retry parameter lookup**. Either way the demo still runs: step 2 falls back to the capsule's own defaults. |
-| A parameter you set had no effect | Only values that differ from the panel's default are sent — an untouched field is left out on purpose, so the capsule uses (and reports) its own default. The form's caption says how many parameters will travel. Otherwise check the report's **Report parameters** card: it lists what the run actually received and flags anything it had to skip (an unparseable date or number logs a warning and is ignored — it never fails the run). The same values are frozen onto the captured `Report — <ts>` asset as `app_parameters`. |
+| A capsule refuses to run: **403 `corrupted object files`**, naming `.codeocean/app-panel.json` | That file is present in the capsule and makes it unrunnable. Delete `.codeocean/app-panel.json` from the capsule (commit the deletion, or push a commit that removes it) and the capsule runs again. Never add it back: the demo's parameters do not need it — see [Do not add an app-panel.json](#do-not-add-an-app-paneljson). |
+| A parameter you set had no effect | Only values that differ from the default are sent — an untouched field is left out on purpose, so the capsule uses (and reports) its own default. The form's caption says how many parameters will travel. Otherwise check the report's **Report parameters** card: it lists what the run actually received and flags anything it had to skip (an unparseable date or number logs a warning and is ignored — it never fails the run). The same values are frozen onto the captured `Report — <ts>` asset as `app_parameters`. |
 | Report renders blank in the app | Only happens if the report is not self-contained. Confirm the log's `wrote /results/report.html` line reports over 1 MB — plotly.js is inlined, so a small file means a bad build. |
 | Polling seems to stop mid-run | Clicking anything mid-poll ends Streamlit's script run; the Code Ocean computation keeps going. Use the app's **🔁 Resume polling** button. |
 | Environment build fails on the app capsule | Retry the build; if it persists, pin versions in the Environment Editor and rerun the sanity-check run before launching the workstation. |
@@ -356,17 +372,21 @@ for each of the four repos.
 
 ## Customizing the demo
 
-**Add a parameter to the report — without touching the app.** This is the headline of
-the demo, and it is worth doing live. Add an entry to the step-2 capsule's
-`.codeocean/app-panel.json` (a `name` for the label, a `param_name` for the argument key,
-a `type` of `text` or `list`, a `default_value`, and `value_options` for a list), push it
-to the capsule, then reload the app (the panel lookup is cached per session, and
-**🔄 Retry parameter lookup** re-runs it if the lookup ever fails): the new field is in
-the **⚙️ Report parameters** form straight away, because the app builds that form from
-`client.capsules.get_capsule_app_panel(...)` rather than from anything of its own. Handle
-the new argument in `make_report.py` — `code/run` forwards `"$@"` and the script parses
-`--param_name=value` with `argparse` — and the value you type in the GUI then lands in
-`app_parameters` on the captured `Report — <ts>` asset, alongside the run that used it.
+**Add a parameter to the report.** This is the headline of the demo, and it is worth
+doing live. It touches two places, and neither of them is a Code Ocean config file:
+
+1. **The capsule** — add an entry to `PARAM_SPECS` in the step-2 capsule's
+   `code/make_report.py` (argument key, label, default) and use the value. `code/run`
+   forwards `"$@"` and the script parses `--param_name=value` with `argparse`, so nothing
+   else has to change; unknown arguments are ignored, so the capsule stays runnable
+   whatever the app sends.
+2. **The app** — add the same parameter to the app's own parameter list so a widget
+   appears in the **⚙️ Report parameters** form and the value is sent with the run.
+
+The value you type in the GUI then lands in `app_parameters` on the captured
+`Report — <ts>` asset, alongside the run that used it. Do **not** create a
+`.codeocean/app-panel.json` for the new parameter — that file does not add a panel, it
+makes the capsule unrunnable ([why](#do-not-add-an-app-paneljson)).
 
 Two documented limits apply to free-text values:
 
